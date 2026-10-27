@@ -292,6 +292,10 @@ def panel_date(panel: Tag, labels: dict[str, dt.date]) -> dt.date | None:
     return labels.get(n)
 
 
+# Film links are "/event/123", "event/123" (Reel Picture) or absolute URLs.
+EVENT_HREF = re.compile(r"(^|/)event/\d+")
+
+
 def scrape_admitone(cinema: dict, target: dt.date, today: dt.date) -> list[Showing]:
     soup = fetch(cinema["url"])
     labels = {}
@@ -312,14 +316,14 @@ def scrape_admitone(cinema: dict, target: dt.date, today: dt.date) -> list[Showi
             text = clean(link.get_text(" "))
             time = first_time(text)
             heading = link.find_previous(
-                lambda t: t.name in ("h2", "h3") and t.find("a", href=re.compile(r"/event/")))
+                lambda t: t.name in ("h2", "h3") and t.find("a", href=EVENT_HREF))
             if not time or heading is None:
                 continue
             fmt = clean(text[:TIME_RE.search(text).start()])
             if not fmt and link.find("img"):
                 fmt = re.sub(r"\s*icon$", "", clean(link.find("img").get("alt", "")), flags=re.I)
             rating = rating_from_img(link.find_previous(is_rating_img))
-            film_a = heading.find("a", href=re.compile(r"/event/"))
+            film_a = heading.find("a", href=EVENT_HREF)
             out.append(Showing(clean(heading.get_text()), rating, cinema["name"], time, fmt,
                                url=urljoin(cinema["url"], link["href"]),
                                film_url=urljoin(cinema["url"], film_a["href"])))
