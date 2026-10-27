@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-showtimes.py - consolidated cinema showtimes for Cork, Waterford and Blanchardstown.
+showtimes.py - consolidated cinema showtimes for Cork, Waterford, Dublin and Blanchardstown.
 
 Usage:
     python3 showtimes.py                  # Cork, today, PG highlighted
     python3 showtimes.py waterford        # another location (or: w)
-    python3 showtimes.py b                # Blanchardstown (aliases: d, dublin)
+    python3 showtimes.py d                # all of Dublin
+    python3 showtimes.py b                # just Blanchardstown
     python3 showtimes.py --day 1          # tomorrow
     python3 showtimes.py --date 2026-10-24
     python3 showtimes.py --upcoming       # hide sessions that already started
@@ -15,6 +16,7 @@ Usage:
     python3 showtimes.py --cinema reel    # only cinemas whose name contains "reel"
     python3 showtimes.py --urls           # print booking links as a column
     python3 showtimes.py --premium        # only premium screens (★)
+    python3 showtimes.py --no-cache       # ignore pages cached in the last 15 minutes
 
 In terminals that support hyperlinks (Windows Terminal, GNOME Terminal, iTerm2...)
 the time opens the booking page and the movie title opens the film page
@@ -26,11 +28,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import os
 import re
 import sys
+import threading
+import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode, urlsplit
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -52,6 +59,24 @@ except Exception:          # no tz database: fall back to the machine's local ti
 #   "premium": session formats to flag with a star (case-insensitive,
 #              matched against the label the site shows, e.g. "PURE 14:30")
 # --------------------------------------------------------------------------
+CT = "https://cinematimes.com/ie/"
+ODEON_PREMIUM = ["IMAX", "ISENSE", "RECLINER"]
+IMC_PREMIUM = ["GALACTIC", "LUXX"]
+
+
+def ct(name: str, path: str, premium: list[str] | None = None) -> dict:
+    """A cinema read from its cinematimes.com page (path after /ie/)."""
+    return {"name": name, "kind": "cinematimes", "url": CT + path, "premium": premium or []}
+
+
+def unsupported(name: str) -> dict:
+    return {"name": name, "kind": "unsupported"}
+
+
+ODEON_BLANCH = ct("Odeon Blanchardstown",
+                  "dublin/cinemas/odeon-cinema-blanchardstown-dublin-15/", ODEON_PREMIUM)
+DRAIOCHT = ct("Draíocht Blanchardstown", "dublin/cinemas/draiocht-blanchardstown/")
+
 LOCATIONS = {
     "cork": [
         {"name": "Reel Ballincollig", "kind": "admitone",
@@ -71,20 +96,37 @@ LOCATIONS = {
         {"name": "Omniplex Waterford", "kind": "omniplex",
          "url": "https://www.omniplex.ie/cinema/showtimes/waterford",
          "premium": ["MAXX"]},
-        {"name": "Odeon Waterford", "kind": "cinematimes",
-         "url": "https://cinematimes.com/ie/waterford/cinemas/odeon-cinema-waterford-city/",
-         "premium": ["IMAX", "ISENSE", "RECLINER"]},
+        ct("Odeon Waterford", "waterford/cinemas/odeon-cinema-waterford-city/", ODEON_PREMIUM),
     ],
-    "blanchardstown": [
-        {"name": "Odeon Blanchardstown", "kind": "cinematimes",
-         "url": "https://cinematimes.com/ie/dublin/cinemas/odeon-cinema-blanchardstown-dublin-15/",
-         "premium": ["IMAX", "ISENSE", "RECLINER"]},
+    "dublin": [
+        ct("Cineworld Dublin", "dublin/cinemas/cineworld-cinemas-dublin-1/", ["IMAX", "4DX"]),
+        ct("IMC Savoy", "dublin/cinemas/savoy-cinema-dublin-1/", IMC_PREMIUM),
+        ct("IMC Santry", "dublin/cinemas/imc-santry-cinema-dublin-9/", IMC_PREMIUM),
+        ct("IMC Dun Laoghaire", "dublin/cinemas/imc-dun-laoghaire/", IMC_PREMIUM),
+        ct("Odeon Point Square", "dublin/cinemas/odeon-cinema-point-village-dublin-1/", ODEON_PREMIUM),
+        ct("Odeon Charlestown", "dublin/cinemas/odeon-cinemas-dublin/", ODEON_PREMIUM),
+        ct("Odeon Coolock", "dublin/cinemas/odeon-cinema-coolock-dublin-5/", ODEON_PREMIUM),
+        ct("Odeon Stillorgan", "dublin/cinemas/odeon-cinema-stillorgan/", ODEON_PREMIUM),
+        ODEON_BLANCH,
+        ct("Omniplex Rathmines", "dublin/cinemas/omniplex-rathmines-dublin-6/", ["MAXX"]),
+        ct("Omniplex Nutgrove", "dublin/cinemas/omniplex-nutgrove-dublin/", ["MAXX"]),
+        ct("Omniplex Balbriggan", "dublin/cinemas/omniplex-balbriggan/", ["MAXX"]),
+        ct("Vue Liffey Valley", "dublin/cinemas/dublin-liffey-valley/"),
+        ct("Light House", "dublin/cinemas/light-house-cinema-dublin-7/"),
+        DRAIOCHT,
+        # No listings on cinematimes.com for these yet:
+        unsupported("IFI"),
+        unsupported("Stella Rathmines"),
+        unsupported("Movies@ Dundrum"),
+        unsupported("Movies@ Swords"),
+        unsupported("Movies@ The Square"),
     ],
+    "blanchardstown": [ODEON_BLANCH, DRAIOCHT],
 }
 DEFAULT_LOCATION = "cork"
 # Short forms and other names for a location (case-insensitive).
-ALIASES = {"c": "cork", "w": "waterford", "b": "blanchardstown",
-           "d": "blanchardstown", "dublin": "blanchardstown"}
+ALIASES = {"c": "cork", "w": "waterford", "d": "dublin", "b": "blanchardstown",
+           "blanch": "blanchardstown"}
 
 
 def resolve_location(name: str) -> str:
@@ -104,6 +146,11 @@ HEADERS = {
     "Accept-Language": "en-IE,en;q=0.9",
 }
 TIMEOUT = 20
+PER_HOST_CONCURRENCY = 2      # simultaneous requests to any one site
+PER_HOST_GAP = 0.7            # seconds between request starts to the same site
+MAX_RETRIES = 4               # on 429 Too Many Requests / 503
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "showtimes"
+CACHE_TTL = 15 * 60           # seconds; --no-cache to bypass
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
 
 
@@ -127,14 +174,56 @@ def today_local() -> dt.date:
     return dt.datetime.now(TZ).date() if TZ else dt.date.today()
 
 
+_session = requests.Session()
+_session.headers.update(HEADERS)
+_host_locks: dict[str, threading.Semaphore] = {}
+_host_last: dict[str, float] = {}
+_meta_lock = threading.Lock()
+USE_CACHE = True
+
+
+def _polite_get(url: str, params: dict | None) -> requests.Response:
+    """GET with per-site throttling and retries on 429/503."""
+    host = urlsplit(url).netloc
+    with _meta_lock:
+        sem = _host_locks.setdefault(host, threading.Semaphore(PER_HOST_CONCURRENCY))
+    with sem:
+        for attempt in range(MAX_RETRIES + 1):
+            with _meta_lock:     # space out request starts to the same site
+                wait = _host_last.get(host, 0) + PER_HOST_GAP - _time.monotonic()
+                _host_last[host] = _time.monotonic() + max(wait, 0)
+            if wait > 0:
+                _time.sleep(wait)
+            r = _session.get(url, params=params, timeout=TIMEOUT)
+            if r.status_code not in (429, 503) or attempt == MAX_RETRIES:
+                r.raise_for_status()
+                return r
+            retry_after = r.headers.get("Retry-After", "")
+            delay = int(retry_after) if retry_after.isdigit() else 2 ** (attempt + 1)
+            with _meta_lock:     # make other threads for this site back off too
+                _host_last[host] = _time.monotonic() + min(delay, 60)
+            _time.sleep(min(delay, 60))
+    raise RuntimeError("unreachable")
+
+
 def fetch(url: str, params: dict | None = None) -> BeautifulSoup:
-    r = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
+    full = url + ("?" + urlencode(params) if params else "")
+    path = CACHE_DIR / (hashlib.sha1(full.encode()).hexdigest() + ".html")
+    if USE_CACHE and path.exists() and _time.time() - path.stat().st_mtime < CACHE_TTL:
+        return BeautifulSoup(path.read_bytes().decode("utf-8", "replace"), "html.parser")
+
+    r = _polite_get(url, params)
     # Sites declare ISO-8859-1 but actually serve UTF-8.
     try:
         text = r.content.decode("utf-8")
     except UnicodeDecodeError:
         text = r.content.decode("latin-1")
+    if USE_CACHE:
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
     return BeautifulSoup(text, "html.parser")
 
 
@@ -327,7 +416,7 @@ SCRAPERS = {"admitone": scrape_admitone, "omniplex": scrape_omniplex,
 
 def scrape(cinema: dict, target: dt.date, today: dt.date):
     if cinema["kind"] not in SCRAPERS:
-        return [], f"{cinema['name']}: {cinema.get('note', 'not supported')}"
+        return [], None
     try:
         shows = SCRAPERS[cinema["kind"]](cinema, target, today)
         prem = [x.upper() for x in cinema.get("premium", [])]
@@ -399,11 +488,50 @@ def print_table(rows: list[Showing], highlight: set[str], details: bool, urls: b
         print(txt)
 
 
+SORT_KEYS = {
+    "time":   lambda s: (s.time, s.movie.lower(), s.cinema),
+    "movie":  lambda s: (s.movie.lower(), s.time, s.cinema),
+    "cinema": lambda s: (s.cinema, s.time, s.movie.lower()),
+}
+
+
+def collect(location: str, target: dt.date, cinema_filter: str | None = None):
+    """Fetch one location's showings for a day.
+
+    Returns (rows, errors, skipped): all showings unfiltered, error messages for
+    cinemas that failed, and names of cinemas with no listings source.
+    """
+    today = today_local()
+    cinemas = [c for c in LOCATIONS[location]
+               if not cinema_filter or cinema_filter.lower() in c["name"].lower()]
+    if not cinemas:
+        return [], [], []
+    with ThreadPoolExecutor(max_workers=len(cinemas)) as ex:
+        results = list(ex.map(lambda c: scrape(c, target, today), cinemas))
+    rows = [s for shows, _ in results for s in shows]
+    errors = [e for _, e in results if e]
+    skipped = [c["name"] for c in cinemas if c["kind"] not in SCRAPERS]
+    return rows, errors, skipped
+
+
+def filter_rows(rows: list[Showing], target: dt.date, only: set[str] | None = None,
+                premium: bool = False, upcoming: bool = False,
+                sort: str = "time") -> list[Showing]:
+    if only:
+        rows = [s for s in rows if rating_matches(s.rating, only)]
+    if premium:
+        rows = [s for s in rows if s.premium]
+    if upcoming and target == today_local():
+        now = dt.datetime.now(TZ).strftime("%H:%M")
+        rows = [s for s in rows if s.time >= now]
+    return sorted(rows, key=SORT_KEYS[sort])
+
+
 def main():
     p = argparse.ArgumentParser(description="Consolidated cinema showtimes")
     p.add_argument("location", nargs="?", default=DEFAULT_LOCATION, type=resolve_location,
-                   help="cork, waterford or blanchardstown (or c, w, b; d/dublin = "
-                        "blanchardstown). Default: cork")
+                   help="cork, waterford, dublin or blanchardstown (or c, w, d, b). "
+                        "Default: cork")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--date", help="YYYY-MM-DD (default: today)")
     g.add_argument("--day", type=int, default=0, help="days from today (0 = today)")
@@ -411,44 +539,29 @@ def main():
     p.add_argument("--only", help="only these ratings, e.g. PG,G")
     p.add_argument("--highlight", default="PG", help="ratings to highlight (default: PG)")
     p.add_argument("--upcoming", action="store_true", help="hide sessions already started")
-    p.add_argument("--sort", choices=["time", "movie", "cinema"], default="time")
+    p.add_argument("--sort", choices=list(SORT_KEYS), default="time")
     p.add_argument("--details", action="store_true", help="show the format column")
     p.add_argument("--premium", action="store_true", help="only premium screens")
     p.add_argument("--urls", action="store_true", help="print booking links as a column")
     p.add_argument("--no-color", action="store_true", help="no colours or clickable links")
+    p.add_argument("--no-cache", action="store_true",
+                   help=f"always fetch fresh pages (default: reuse pages up to "
+                        f"{CACHE_TTL // 60} min old)")
     args = p.parse_args()
 
     if args.no_color:
         C.on = False
+    global USE_CACHE
+    USE_CACHE = not args.no_cache
     today = today_local()
     target = (dt.date.fromisoformat(args.date) if args.date
               else today + dt.timedelta(days=args.day))
-    cinemas = [c for c in LOCATIONS[args.location]
-               if not args.cinema or args.cinema.lower() in c["name"].lower()]
-    if not cinemas:
+
+    rows, errors, skipped = collect(args.location, target, args.cinema)
+    if not rows and not errors and not skipped:
         sys.exit("no cinema matches --cinema")
-
-    with ThreadPoolExecutor(max_workers=len(cinemas)) as ex:
-        results = list(ex.map(lambda c: scrape(c, target, today), cinemas))
-
-    rows = [s for shows, _ in results for s in shows]
-    errors = [e for _, e in results if e]
-
-    if args.only:
-        only = {x.strip().upper() for x in args.only.split(",")}
-        rows = [s for s in rows if rating_matches(s.rating, only)]
-    if args.premium:
-        rows = [s for s in rows if s.premium]
-    if args.upcoming and target == today:
-        now = dt.datetime.now(TZ).strftime("%H:%M")
-        rows = [s for s in rows if s.time >= now]
-
-    sort_keys = {
-        "time":   lambda s: (s.time, s.movie.lower(), s.cinema),
-        "movie":  lambda s: (s.movie.lower(), s.time, s.cinema),
-        "cinema": lambda s: (s.cinema, s.time, s.movie.lower()),
-    }
-    rows.sort(key=sort_keys[args.sort])
+    only = {x.strip().upper() for x in args.only.split(",")} if args.only else None
+    rows = filter_rows(rows, target, only, args.premium, args.upcoming, args.sort)
 
     print(f"Showtimes in {args.location.title()} for {target:%A %d %B %Y}\n")
     if rows:
@@ -456,10 +569,12 @@ def main():
                     args.details, args.urls)
     else:
         print("No showtimes found.")
-    if errors:
+    if errors or skipped:
         print(file=sys.stderr)
     for e in errors:
-        print(f"note: {e}", file=sys.stderr)
+        print(f"error: {e}", file=sys.stderr)
+    if skipped:
+        print(f"not included (no listings source yet): {', '.join(skipped)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
